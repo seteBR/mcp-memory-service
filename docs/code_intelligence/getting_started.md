@@ -198,14 +198,84 @@ python cli.py batch-report project-name --format json --output data.json
 
 ### Configuration
 
-Add the code intelligence server to your Claude Desktop configuration:
+Add the code intelligence server to your Claude Desktop configuration. The configuration file location depends on your operating system:
+
+- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Linux**: `~/.config/Claude/claude_desktop_config.json`
+
+#### Standard Configuration (with uv)
 
 ```json
 {
   "mcpServers": {
-    "code-intelligence": {
+    "memory": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/path/to/mcp-memory-service",
+        "run",
+        "mcp_memory_service.enhanced_server"
+      ],
+      "env": {
+        "MCP_MEMORY_CHROMA_PATH": "/path/to/chroma_db",
+        "MCP_MEMORY_BACKUPS_PATH": "/path/to/backups",
+        "ENABLE_CODE_INTELLIGENCE": "true",
+        "CODE_INTELLIGENCE_WORKERS": "4",
+        "CODE_INTELLIGENCE_CACHE_SIZE": "1000",
+        "CODE_INTELLIGENCE_LANGUAGES": "python,javascript,typescript,go,rust,java,cpp,c",
+        "ENABLE_FILE_WATCHING": "true",
+        "AUTO_SYNC_ENABLED": "true"
+      }
+    }
+  }
+}
+```
+
+#### Windows with WSL Configuration
+
+For Windows users running the memory service in WSL:
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "command": "wsl",
+      "args": [
+        "--",
+        "uv",
+        "--directory",
+        "/home/username/mcp-memory-service",
+        "run",
+        "mcp_memory_service.enhanced_server"
+      ],
+      "env": {
+        "MCP_MEMORY_CHROMA_PATH": "/home/username/.local/share/mcp-memory/chroma_db",
+        "MCP_MEMORY_BACKUPS_PATH": "/home/username/.local/share/mcp-memory/backups",
+        "ENABLE_CODE_INTELLIGENCE": "true",
+        "CODE_INTELLIGENCE_WORKERS": "4",
+        "ENABLE_FILE_WATCHING": "true",
+        "AUTO_SYNC_ENABLED": "true"
+      }
+    }
+  }
+}
+```
+
+#### Direct Python Configuration
+
+If not using uv:
+
+```json
+{
+  "mcpServers": {
+    "memory": {
       "command": "python",
-      "args": ["/path/to/mcp-memory-service/src/mcp_memory_service/enhanced_server.py"],
+      "args": [
+        "-m",
+        "mcp_memory_service.enhanced_server"
+      ],
+      "cwd": "/path/to/mcp-memory-service",
       "env": {
         "MCP_MEMORY_CHROMA_PATH": "/path/to/chroma_db",
         "ENABLE_CODE_INTELLIGENCE": "true",
@@ -216,6 +286,21 @@ Add the code intelligence server to your Claude Desktop configuration:
   }
 }
 ```
+
+### Verifying Code Intelligence is Active
+
+After updating your configuration and restarting Claude Desktop:
+
+1. Check if the enhanced server is running with code intelligence enabled
+2. Look for the additional MCP tools in Claude (like `search_code`, `analyze_security`, etc.)
+3. Try analyzing a repository to confirm functionality
+
+### Important Notes
+
+- **Enhanced Server Required**: You must use `mcp_memory_service.enhanced_server` (not just `server`) to enable code intelligence features
+- **Environment Variable**: `ENABLE_CODE_INTELLIGENCE` must be set to `"true"` (as a string)
+- **Restart Required**: Claude Desktop must be completely restarted after configuration changes
+- **Backward Compatibility**: The enhanced server maintains 100% backward compatibility with existing memory operations
 
 ### Available MCP Tools
 
