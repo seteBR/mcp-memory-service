@@ -28,6 +28,7 @@ from ..utils.system_detection import (
     print_system_diagnostics,
     AcceleratorType
 )
+from ..utils.chroma_lock import with_chroma_lock, with_retry, ChromaDBLock
 import mcp.types as types
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,7 @@ class ChromaMemoryStorage(MemoryStorage):
         self.collection = None
         self.system_info = get_system_info()
         self.embedding_settings = get_optimal_embedding_settings()
+        self._chroma_lock = ChromaDBLock(path)
         
         # Log system information
         logger.info(f"Detected system: {self.system_info.os_name} {self.system_info.architecture}")
@@ -207,6 +209,8 @@ class ChromaMemoryStorage(MemoryStorage):
         logger.error(f"Invalid timestamp type: {type(ts)}")
         return time.time()
     
+    @with_chroma_lock(timeout=30.0)
+    @with_retry(max_attempts=3, delay=1.0)
     async def store(self, memory: Memory) -> Tuple[bool, str]:
         """Store a memory with proper embedding handling."""
         try:
@@ -283,6 +287,8 @@ class ChromaMemoryStorage(MemoryStorage):
             logger.error(f"Error searching by tags: {e}")
             return []
 
+    @with_chroma_lock(timeout=30.0)
+    @with_retry(max_attempts=3, delay=1.0)
     async def delete_by_tag(self, tag: str) -> Tuple[int, str]:
         """Deletes memories that match the specified tag."""
         try:
@@ -315,6 +321,8 @@ class ChromaMemoryStorage(MemoryStorage):
             logger.error(f"Error deleting memories by tag: {e}")
             return 0, f"Error deleting memories by tag: {e}"
       
+    @with_chroma_lock(timeout=30.0)
+    @with_retry(max_attempts=3, delay=1.0)
     async def delete(self, content_hash: str) -> Tuple[bool, str]:
         """Delete a memory by its hash."""
         try:
@@ -336,6 +344,8 @@ class ChromaMemoryStorage(MemoryStorage):
             logger.error(f"Error deleting memory: {str(e)}")
             return False, f"Error deleting memory: {str(e)}"
 
+    @with_chroma_lock(timeout=30.0)
+    @with_retry(max_attempts=3, delay=1.0)
     async def cleanup_duplicates(self) -> Tuple[int, str]:
         """Remove duplicate memories based on content hash."""
         try:

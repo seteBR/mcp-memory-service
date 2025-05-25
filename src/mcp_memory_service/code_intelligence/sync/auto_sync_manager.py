@@ -429,8 +429,11 @@ class AutoSyncManager:
             for config_path in claude_config_paths:
                 if config_path.exists():
                     try:
-                        with open(config_path, 'r') as f:
-                            config = json.load(f)
+                        # Use asyncio to read file without blocking
+                        loop = asyncio.get_event_loop()
+                        with await loop.run_in_executor(None, open, config_path, 'r') as f:
+                            content = await loop.run_in_executor(None, f.read)
+                            config = json.loads(content)
                             if 'allowed_paths' in config:
                                 paths = config['allowed_paths']
                                 if isinstance(paths, list) and paths:

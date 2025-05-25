@@ -153,16 +153,27 @@ class MemoryServer:
             print(f"Accelerator: {self.system_info.accelerator}", file=sys.stderr, flush=True)
             print(f"Python: {platform.python_version()}", file=sys.stderr, flush=True)
             
-            # Validate database health with timeout
+            # Validate database health with timeout and better error handling
             try:
-                success = await asyncio.wait_for(
-                    self.validate_database_health(),
-                    timeout=10.0
-                )
+                print("Starting database health check...", file=sys.stderr, flush=True)
+                # Run the validation in a separate task with timeout
+                validation_task = asyncio.create_task(self.validate_database_health())
+                success = await asyncio.wait_for(validation_task, timeout=5.0)
+                print(f"Database health check completed: {success}", file=sys.stderr, flush=True)
                 if not success:
                     logger.warning("Database health check failed, but server will continue")
             except asyncio.TimeoutError:
-                logger.warning("Database health check timed out, continuing anyway")
+                logger.warning("Database health check timed out after 5s, continuing anyway")
+                print("Database health check timed out (5s), continuing...", file=sys.stderr, flush=True)
+                # Cancel the task to prevent it from running in background
+                validation_task.cancel()
+                try:
+                    await validation_task
+                except asyncio.CancelledError:
+                    pass
+            except Exception as e:
+                logger.error(f"Database health check error: {str(e)}")
+                print(f"Database health check error: {str(e)}", file=sys.stderr, flush=True)
             
             # Add explicit console error output for Smithery to see
             print("MCP Memory Service initialization completed", file=sys.stderr, flush=True)
@@ -188,7 +199,7 @@ class MemoryServer:
                 
                 # Attempt repair
                 logger.info("Attempting database repair...")
-                repair_success, repair_message = await repair_database(self.storage)
+                repair_success, repair_message = await loop.run_in_executor(None, repair_database, self.storage)
                 
                 if not repair_success:
                     logger.error(f"Database repair failed: {repair_message}")
@@ -599,6 +610,14 @@ class MemoryServer:
                         },
                         "required": ["before_date"]
                     }
+                ),
+                types.Tool(
+                    name="get_concurrent_access_stats",
+                    description="Get statistics about concurrent access and lock performance",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {}
+                    }
                 )
             ]
         
@@ -639,6 +658,8 @@ class MemoryServer:
                     return await self.handle_delete_by_timeframe(arguments)
                 elif name == "delete_before_date":
                     return await self.handle_delete_before_date(arguments)
+                elif name == "get_concurrent_access_stats":
+                    return await self.handle_get_concurrent_access_stats(arguments)
                 else:
                     raise ValueError(f"Unknown tool: {name}")
             except Exception as e:
@@ -647,23 +668,43 @@ class MemoryServer:
 
     async def validate_database_health(self):
         """Validate database health during initialization."""
-        from .utils.db_utils import validate_database, repair_database
-        
-        # Check database health
-        is_valid, message = await validate_database(self.storage)
-        if not is_valid:
-            logger.warning(f"Database validation failed: {message}")
+        try:
+            from .utils.db_utils import validate_database, repair_database
             
-            # Attempt repair
-            logger.info("Attempting database repair...")
-            repair_success, repair_message = await repair_database(self.storage)
+            # Add debug logging to trace the hang
+            logger.debug("validate_database_health: Starting...")
             
-            if not repair_success:
-                raise RuntimeError(f"Database repair failed: {repair_message}")
+            # Check database health - run sync function in executor to avoid blocking
+            logger.debug("validate_database_health: Calling validate_database...")
+            loop = asyncio.get_event_loop()
+            is_valid, message = await loop.run_in_executor(None, validate_database, self.storage)
+            logger.debug(f"validate_database_health: validate_database returned: {is_valid}, {message}")
+            
+            if not is_valid:
+                logger.warning(f"Database validation failed: {message}")
+                
+                # Attempt repair only if it's a repairable issue
+                if "Cannot access collection" in message:
+                    logger.error("Cannot access database collection, skipping repair")
+                    return False
+                
+                logger.info("Attempting database repair...")
+                repair_success, repair_message = await loop.run_in_executor(None, repair_database, self.storage)
+                
+                if not repair_success:
+                    logger.error(f"Database repair failed: {repair_message}")
+                    return False
+                else:
+                    logger.info(f"Database repair successful: {repair_message}")
+                    return True
             else:
-                logger.info(f"Database repair successful: {repair_message}")
-        else:
-            logger.info(f"Database validation successful: {message}")
+                logger.info(f"Database validation successful: {message}")
+                return True
+        except Exception as e:
+            logger.error(f"Error during database validation: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
 
     async def handle_store_memory(self, arguments: dict) -> List[types.TextContent]:
         content = arguments.get("content")
@@ -1131,6 +1172,53 @@ class MemoryServer:
                 type="text",
                 text=f"Error deleting memories: {str(e)}"
             )]
+    
+    async def handle_get_concurrent_access_stats(self, arguments: dict) -> List[types.TextContent]:
+        """Get statistics about concurrent access and lock performance."""
+        try:
+            # Check if storage has the lock attribute
+            if hasattr(self.storage, '_chroma_lock'):
+                stats = self.storage._chroma_lock.get_stats()
+                
+                # Format statistics
+                stats_text = [
+                    "=== Concurrent Access Statistics ===",
+                    f"Total lock acquisitions: {stats['total_acquisitions']}",
+                    f"Failed acquisitions: {stats['failed_acquisitions']}",
+                    f"Average wait time: {stats['average_wait_time']:.3f}s",
+                    f"Maximum wait time: {stats['max_wait_time']:.3f}s",
+                    f"Currently active locks: {stats['active_locks']}",
+                ]
+                
+                if stats['last_acquisition']:
+                    stats_text.append(f"Last acquisition: {stats['last_acquisition']}")
+                
+                # Add ChromaDB health info
+                try:
+                    results = await self.storage.check_health()
+                    if results:
+                        stats_text.extend([
+                            "",
+                            "=== Database Health ===",
+                            f"Total memories: {results.get('total_memories', 'Unknown')}",
+                            f"Status: {results.get('status', 'Unknown')}"
+                        ])
+                except:
+                    pass
+                
+                return [types.TextContent(type="text", text="\n".join(stats_text))]
+            else:
+                return [types.TextContent(
+                    type="text", 
+                    text="Concurrent access statistics not available. Locking may not be enabled."
+                )]
+                
+        except Exception as e:
+            logger.error(f"Error getting concurrent access stats: {str(e)}")
+            return [types.TextContent(
+                type="text",
+                text=f"Error getting concurrent access statistics: {str(e)}"
+            )]
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -1198,21 +1286,27 @@ async def async_main():
         retry_count = 0
         init_success = False
         
+        print("Starting async initialization...", file=sys.stderr, flush=True)
         while retry_count <= max_retries and not init_success:
             if retry_count > 0:
                 logger.warning(f"Retrying initialization (attempt {retry_count}/{max_retries})...")
                 
+            print(f"Creating initialization task (attempt {retry_count})...", file=sys.stderr, flush=True)
             init_task = asyncio.create_task(memory_server.initialize())
             try:
                 # 30 second timeout for initialization
+                print("Waiting for initialization (30s timeout)...", file=sys.stderr, flush=True)
                 init_success = await asyncio.wait_for(init_task, timeout=30.0)
                 if init_success:
                     logger.info("Async initialization completed successfully")
+                    print("Initialization successful", file=sys.stderr, flush=True)
                 else:
                     logger.warning("Initialization returned failure status")
+                    print("Initialization failed", file=sys.stderr, flush=True)
                     retry_count += 1
             except asyncio.TimeoutError:
                 logger.warning("Async initialization timed out. Continuing with server startup.")
+                print("Initialization timed out after 30s", file=sys.stderr, flush=True)
                 # Don't cancel the task, let it complete in the background
                 break
             except Exception as init_error:
@@ -1225,8 +1319,11 @@ async def async_main():
                     await asyncio.sleep(2)
         
         # Start the server
+        logger.info("Creating stdio server...")
+        print("Creating stdio server...", file=sys.stderr, flush=True)
         async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
             logger.info("Server started and ready to handle requests")
+            print("Server ready to handle requests", file=sys.stderr, flush=True)
             await memory_server.server.run(
                 read_stream,
                 write_stream,

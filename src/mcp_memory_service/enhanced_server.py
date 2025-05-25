@@ -18,6 +18,7 @@ from .code_intelligence.batch.batch_processor import BatchProcessor
 from .code_intelligence.monitoring.metrics_collector import get_metrics_collector, initialize_metrics
 from .performance.cache import cache_manager
 from .security.analyzer import security_analyzer
+from .utils.process_lock import ProcessLock
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ class EnhancedMemoryServer(MemoryServer):
         self.enable_file_watching = enable_file_watching
         self.enable_metrics = enable_metrics
         self._mcp_context = mcp_context  # Store MCP context from Claude Code
+        self._parent_tools = None  # Store parent tools before overriding
         super().__init__()
         
         # Initialize metrics collection if enabled
@@ -59,19 +61,427 @@ class EnhancedMemoryServer(MemoryServer):
             if mcp_context:
                 self.auto_sync_manager._mcp_context = mcp_context
             
-            # Start auto-sync after initialization
-            asyncio.create_task(self._start_auto_sync())
+            # Defer lock check to async startup to avoid blocking
+            self._auto_sync_lock = None
+            self._should_start_auto_sync = None
+            self._auto_sync_task = None
         else:
             self.repository_sync = None
             self.batch_processor = None
             self.auto_sync_manager = None
+            self._should_start_auto_sync = False
+            self._auto_sync_lock = None
             
         logger.info(f"Enhanced Memory Server initialized (code intelligence: {enable_code_intelligence}, file watching: {enable_file_watching}, metrics: {enable_metrics})")
+        
+        # Override parent's list_tools handler to add our initialization
+        self._original_list_tools = None
+        self._init_complete = False
+    
+    def _check_auto_sync_lock(self) -> bool:
+        """Check if we should acquire auto-sync lock."""
+        try:
+            self._auto_sync_lock = ProcessLock("mcp_auto_sync")
+            if self._auto_sync_lock.acquire():
+                logger.info("Auto-sync lock acquired - will start auto-sync")
+                return True
+            else:
+                logger.info("Another instance is running auto-sync - skipping auto-sync startup")
+                return False
+        except Exception as e:
+            logger.warning(f"Error checking auto-sync lock: {e}")
+            return False
     
     async def _start_auto_sync(self):
         """Start auto-sync after server initialization."""
-        await asyncio.sleep(5)  # Wait for server to fully initialize
-        await self.auto_sync_manager.start()
+        try:
+            await asyncio.sleep(5)  # Wait for server to fully initialize
+            
+            # Check lock asynchronously
+            if not self.auto_sync_manager:
+                return
+                
+            # Check if we should acquire the lock
+            loop = asyncio.get_event_loop()
+            self._should_start_auto_sync = await loop.run_in_executor(None, self._check_auto_sync_lock)
+            
+            if self._should_start_auto_sync and self._auto_sync_lock and self.auto_sync_manager:
+                logger.info("Starting auto-sync manager...")
+                # Add timeout to prevent hanging
+                await asyncio.wait_for(self.auto_sync_manager.start(), timeout=30)
+                logger.info("Auto-sync manager started successfully")
+        except asyncio.TimeoutError:
+            logger.error("Auto-sync startup timed out after 30 seconds")
+            if self._auto_sync_lock:
+                self._auto_sync_lock.release()
+        except Exception as e:
+            logger.error(f"Error starting auto-sync: {e}")
+            if self._auto_sync_lock:
+                self._auto_sync_lock.release()
+    
+    def __del__(self):
+        """Cleanup on destruction."""
+        if hasattr(self, '_auto_sync_lock') and self._auto_sync_lock:
+            try:
+                self._auto_sync_lock.release()
+            except:
+                pass  # Ignore errors during cleanup
+    
+    def get_parent_tools(self) -> List[types.Tool]:
+        """Get the list of tools from parent class."""
+        return [
+            types.Tool(
+                name="store_memory",
+                description="""Store new information with optional tags.
+
+                    Accepts two tag formats in metadata:
+                    - Array: ["tag1", "tag2"]
+                    - String: "tag1,tag2"
+
+                   Examples:
+                    # Using array format:
+                    {
+                        "content": "Memory content",
+                        "metadata": {
+                            "tags": ["important", "reference"],
+                            "type": "note"
+                        }
+                    }
+
+                    # Using string format(preferred):
+                    {
+                        "content": "Memory content",
+                        "metadata": {
+                            "tags": "important,reference",
+                            "type": "note"
+                        }
+                    }""",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "content": {
+                            "type": "string",
+                            "description": "The memory content to store, such as a fact, note, or piece of information."
+                        },
+                        "metadata": {
+                            "type": "object",
+                            "description": "Optional metadata about the memory, including tags and type.",
+                            "properties": {
+                                "tags": {
+                                    "oneOf": [
+                                        {"type": "array", "items": {"type": "string"}},
+                                        {"type": "string"}
+                                    ],
+                                    "description": "Tags to categorize the memory. Can be a comma-separated string or an array of strings."
+                                },
+                                "type": {
+                                    "type": "string",
+                                    "description": "Optional type or category label for the memory, e.g., 'note', 'fact', 'reminder'."
+                                }
+                            }
+                        }
+                    },
+                    "required": ["content"]
+                }
+            ),
+            types.Tool(
+                name="recall_memory",
+                description="""Retrieve memories using natural language time expressions and optional semantic search.
+                    
+                    Supports various time-related expressions such as:
+                    - "yesterday", "last week", "2 days ago"
+                    - "last summer", "this month", "last January"
+                    - "spring", "winter", "Christmas", "Thanksgiving"
+                    - "morning", "evening", "yesterday afternoon"
+                    
+                    Examples:
+                    {
+                        "query": "recall what I stored last week"
+                    }
+                    
+                    {
+                        "query": "find information about databases from two months ago",
+                        "n_results": 5
+                    }
+                    """,
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Natural language query specifying the time frame or content to recall, e.g., 'last week', 'yesterday afternoon', or a topic."
+                        },
+                        "n_results": {
+                            "type": "number",
+                            "default": 5,
+                            "description": "Maximum number of results to return."
+                        }
+                    },
+                    "required": ["query"]
+                }
+            ),
+            types.Tool(
+                name="retrieve_memory",
+                description="""Find relevant memories based on query.
+
+                    Example:
+                    {
+                        "query": "find this memory",
+                        "n_results": 5
+                    }""",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query to find relevant memories based on content."
+                        },
+                        "n_results": {
+                            "type": "number",
+                            "default": 5,
+                            "description": "Maximum number of results to return."
+                        }
+                    },
+                    "required": ["query"]
+                }
+            ),
+            types.Tool(
+                name="search_by_tag",
+                description="""Search memories by tags. Must use array format.
+                    Returns memories matching ANY of the specified tags.
+
+                    Example:
+                    {
+                        "tags": ["important", "reference"]
+                    }""",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "tags": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "List of tags to search for. Returns memories matching ANY of these tags."
+                        }
+                    },
+                    "required": ["tags"]
+                }
+            ),
+            types.Tool(
+                name="delete_memory",
+                description="""Delete a specific memory by its hash.
+
+                    Example:
+                    {
+                        "content_hash": "a1b2c3d4..."
+                    }""",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "content_hash": {
+                            "type": "string",
+                            "description": "Hash of the memory content to delete. Obtainable from memory metadata."
+                        }
+                    },
+                    "required": ["content_hash"]
+                }
+            ),
+            types.Tool(
+                name="delete_by_tag",
+                description="""Delete all memories with a specific tag.
+                    WARNING: Deletes ALL memories containing the specified tag.
+
+                    Example:
+                    {
+                        "tag": "temporary"
+                    }""",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "tag": {
+                            "type": "string",
+                            "description": "Tag label. All memories containing this tag will be deleted."
+                        }
+                    },
+                    "required": ["tag"]
+                }
+            ),
+            types.Tool(
+                name="cleanup_duplicates",
+                description="Find and remove duplicate entries",
+                inputSchema={
+                    "type": "object",
+                    "properties": {}
+                }
+            ),
+            types.Tool(
+                name="get_embedding",
+                description="""Get raw embedding vector for content.
+
+                    Example:
+                    {
+                        "content": "text to embed"
+                    }""",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "content": {
+                            "type": "string",
+                            "description": "Text content to generate an embedding vector for."
+                        }
+                    },
+                    "required": ["content"]
+                }
+            ),
+            types.Tool(
+                name="check_embedding_model",
+                description="Check if embedding model is loaded and working",
+                inputSchema={
+                    "type": "object",
+                    "properties": {}
+                }
+            ),
+            types.Tool(
+                name="debug_retrieve",
+                description="""Retrieve memories with debug information.
+
+                    Example:
+                    {
+                        "query": "debug this",
+                        "n_results": 5,
+                        "similarity_threshold": 0.0
+                    }""",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query for debugging retrieval, e.g., a phrase or keyword."
+                        },
+                        "n_results": {
+                            "type": "number",
+                            "default": 5,
+                            "description": "Maximum number of results to return."
+                        },
+                        "similarity_threshold": {
+                            "type": "number",
+                            "default": 0.0,
+                            "description": "Minimum similarity score threshold for results (0.0 to 1.0)."
+                        }
+                    },
+                    "required": ["query"]
+                }
+            ),
+            types.Tool(
+                name="exact_match_retrieve",
+                description="""Retrieve memories using exact content match.
+
+                    Example:
+                    {
+                        "content": "find exactly this"
+                    }""",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "content": {
+                            "type": "string",
+                            "description": "Exact content string to match against stored memories."
+                        }
+                    },
+                    "required": ["content"]
+                }
+            ),
+            types.Tool(
+                name="check_database_health",
+                description="Check database health and get statistics",
+                inputSchema={
+                    "type": "object",
+                    "properties": {}
+                }
+            ),
+            types.Tool(
+                name="recall_by_timeframe",
+                description="""Retrieve memories within a specific timeframe.
+
+                    Example:
+                    {
+                        "start_date": "2024-01-01",
+                        "end_date": "2024-01-31",
+                        "n_results": 5
+                    }""",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "start_date": {
+                            "type": "string",
+                            "format": "date",
+                            "description": "Start date (inclusive) in YYYY-MM-DD format."
+                        },
+                        "end_date": {
+                            "type": "string",
+                            "format": "date",
+                            "description": "End date (inclusive) in YYYY-MM-DD format."
+                        },
+                        "n_results": {
+                            "type": "number",
+                            "default": 5,
+                            "description": "Maximum number of results to return."
+                        }
+                    },
+                    "required": ["start_date"]
+                }
+            ),
+            types.Tool(
+                name="delete_by_timeframe",
+                description="""Delete memories within a specific timeframe.
+                    Optional tag parameter to filter deletions.
+
+                    Example:
+                    {
+                        "start_date": "2024-01-01",
+                        "end_date": "2024-01-31",
+                        "tag": "temporary"
+                    }""",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "start_date": {
+                            "type": "string",
+                            "format": "date",
+                            "description": "Start date (inclusive) in YYYY-MM-DD format."
+                        },
+                        "end_date": {
+                            "type": "string",
+                            "format": "date",
+                            "description": "End date (inclusive) in YYYY-MM-DD format."
+                        },
+                        "tag": {
+                            "type": "string",
+                            "description": "Optional tag to filter deletions. Only memories with this tag will be deleted."
+                        }
+                    },
+                    "required": ["start_date"]
+                }
+            ),
+            types.Tool(
+                name="delete_before_date",
+                description="""Delete memories before a specific date.
+                    Optional tag parameter to filter deletions.
+
+                    Example:
+                    {
+                        "before_date": "2024-01-01",
+                        "tag": "temporary"
+                    }""",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "before_date": {"type": "string", "format": "date"},
+                        "tag": {"type": "string"}
+                    },
+                    "required": ["before_date"]
+                }
+            )
+        ]
     
     def register_handlers(self):
         """Override to add code intelligence tools while preserving existing ones."""
@@ -85,60 +495,13 @@ class EnhancedMemoryServer(MemoryServer):
         # Override the list_tools handler to include code intelligence tools
         @self.server.list_tools()
         async def handle_list_tools() -> List[types.Tool]:
-            # Get all existing tools first (manually recreate the core ones)
-            existing_tools = [
-                types.Tool(
-                    name="store_memory",
-                    description="Store new information with optional tags",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "content": {"type": "string", "description": "The memory content to store"},
-                            "metadata": {
-                                "type": "object",
-                                "properties": {
-                                    "tags": {
-                                        "oneOf": [
-                                            {"type": "array", "items": {"type": "string"}},
-                                            {"type": "string"}
-                                        ],
-                                        "description": "Tags for categorization"
-                                    },
-                                    "type": {"type": "string", "description": "Memory type"}
-                                }
-                            }
-                        },
-                        "required": ["content"]
-                    }
-                ),
-                types.Tool(
-                    name="retrieve_memory",
-                    description="Find relevant memories based on query",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "query": {"type": "string", "description": "Search query"},
-                            "n_results": {"type": "number", "default": 5, "description": "Max results"}
-                        },
-                        "required": ["query"]
-                    }
-                ),
-                types.Tool(
-                    name="search_by_tag",
-                    description="Search memories by tags",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "tags": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "List of tags to search for"
-                            }
-                        },
-                        "required": ["tags"]
-                    }
-                )
-            ]
+            # Initialize auto-sync on first call if not done yet
+            if not self._init_complete and self.code_intelligence_enabled and self._auto_sync_task is None:
+                self._init_complete = True
+                self._auto_sync_task = asyncio.create_task(self._start_auto_sync())
+            
+            # Get all existing tools from parent
+            existing_tools = self.get_parent_tools()
             
             # Add code intelligence tools
             code_tools = [
@@ -363,13 +726,36 @@ class EnhancedMemoryServer(MemoryServer):
                 arguments = {}
 
             # Route to parent methods for existing tools
-            if name in ["store_memory", "retrieve_memory", "search_by_tag", "delete_memory", 
-                       "delete_by_tag", "cleanup_duplicates", "get_embedding", 
-                       "check_embedding_model", "debug_retrieve", "exact_match_retrieve",
-                       "check_database_health", "recall_memory", "recall_by_timeframe",
-                       "delete_by_timeframe", "delete_before_date"]:
-                # Call the parent's tool handler
-                return await super(EnhancedMemoryServer, self).handle_call_tool(name, arguments)
+            if name == "store_memory":
+                return await self.handle_store_memory(arguments)
+            elif name == "retrieve_memory":
+                return await self.handle_retrieve_memory(arguments)
+            elif name == "recall_memory":
+                return await self.handle_recall_memory(arguments)
+            elif name == "search_by_tag":
+                return await self.handle_search_by_tag(arguments)
+            elif name == "delete_memory":
+                return await self.handle_delete_memory(arguments)
+            elif name == "delete_by_tag":
+                return await self.handle_delete_by_tag(arguments)
+            elif name == "cleanup_duplicates":
+                return await self.handle_cleanup_duplicates(arguments)
+            elif name == "get_embedding":
+                return await self.handle_get_embedding(arguments)
+            elif name == "check_embedding_model":
+                return await self.handle_check_embedding_model(arguments)
+            elif name == "debug_retrieve":
+                return await self.handle_debug_retrieve(arguments)
+            elif name == "exact_match_retrieve":
+                return await self.handle_exact_match_retrieve(arguments)
+            elif name == "check_database_health":
+                return await self.handle_check_database_health(arguments)
+            elif name == "recall_by_timeframe":
+                return await self.handle_recall_by_timeframe(arguments)
+            elif name == "delete_by_timeframe":
+                return await self.handle_delete_by_timeframe(arguments)
+            elif name == "delete_before_date":
+                return await self.handle_delete_before_date(arguments)
             
             # Handle our new code intelligence tools
             elif name == "ingest_code_file":
@@ -1359,7 +1745,8 @@ class EnhancedMemoryServer(MemoryServer):
             import psutil
             
             # Get current system metrics
-            cpu_percent = psutil.cpu_percent(interval=1)
+            # Use interval=0 for non-blocking call (gets average since last call)
+            cpu_percent = psutil.cpu_percent(interval=0)
             memory = psutil.virtual_memory()
             disk = psutil.disk_usage('/')
             
