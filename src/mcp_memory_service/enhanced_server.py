@@ -4,6 +4,7 @@ Maintains backward compatibility while adding new features.
 """
 import asyncio
 import logging
+import os
 import time
 from datetime import datetime
 from typing import Any, List, Dict
@@ -13,6 +14,7 @@ from .server import MemoryServer
 from .models.code import CodeChunk
 from .code_intelligence.chunker.factory import ChunkerFactory
 from .code_intelligence.sync.repository_sync import RepositorySync
+from .code_intelligence.sync.async_repository_sync import AsyncRepositorySync
 from .code_intelligence.sync.auto_sync_manager import AutoSyncManager
 from .code_intelligence.batch.batch_processor import BatchProcessor
 from .code_intelligence.monitoring.metrics_collector import get_metrics_collector, initialize_metrics
@@ -44,10 +46,24 @@ class EnhancedMemoryServer(MemoryServer):
         
         # Initialize repository sync and batch processor if code intelligence is enabled
         if self.code_intelligence_enabled:
-            self.repository_sync = RepositorySync(
-                storage_backend=self.storage,
-                enable_file_watching=enable_file_watching
-            )
+            # Use async repository sync to avoid blocking
+            use_async_sync = os.getenv("USE_ASYNC_SYNC", "true").lower() == "true"
+            
+            if use_async_sync:
+                logger.info("Using AsyncRepositorySync for non-blocking operations")
+                self.repository_sync = AsyncRepositorySync(
+                    storage_backend=self.storage,
+                    enable_file_watching=enable_file_watching,
+                    max_queue_size=int(os.getenv("SYNC_QUEUE_SIZE", "10000")),
+                    batch_size=int(os.getenv("SYNC_BATCH_SIZE", "100"))
+                )
+            else:
+                logger.info("Using standard RepositorySync (may block during sync)")
+                self.repository_sync = RepositorySync(
+                    storage_backend=self.storage,
+                    enable_file_watching=enable_file_watching
+                )
+            
             self.batch_processor = BatchProcessor(storage=self.storage)
             
             # Initialize auto-sync manager
@@ -1373,24 +1389,56 @@ class EnhancedMemoryServer(MemoryServer):
             return [types.TextContent(type="text", text="Error: Repository synchronization not enabled")]
         
         try:
-            status = self.repository_sync.get_repository_status(repository_name)
-            
-            if not status:
-                return [types.TextContent(type="text", text=f"Repository '{repository_name}' not found")]
-            
-            result_lines = [
-                f"Repository Status: {repository_name}",
-                "",
-                f"Path: {status['path']}",
-                f"Total Files: {status.get('total_files', 0)}",
-                f"Cached Files: {status['cached_files']}",
-                f"Total Chunks: {status.get('total_chunks', 0)}",
-                f"Last Sync: {datetime.fromtimestamp(status['last_sync']).strftime('%Y-%m-%d %H:%M:%S')}",
-                f"Sync Type: {status.get('sync_type', 'unknown')}",
-                f"File Watching: {'Enabled' if status['is_watching'] else 'Disabled'}",
-            ]
-            
-            return [types.TextContent(type="text", text="\n".join(result_lines))]
+            # Check if we're using AsyncRepositorySync
+            if hasattr(self.repository_sync, 'get_sync_status'):
+                # AsyncRepositorySync - get real-time sync status
+                status = self.repository_sync.get_sync_status(repository_name)
+                
+                if not status:
+                    return [types.TextContent(type="text", text=f"Repository '{repository_name}' not found")]
+                
+                result_lines = [f"Repository Status: {repository_name}", ""]
+                
+                if status['active']:
+                    # Actively syncing
+                    progress = status['progress']
+                    result_lines.extend([
+                        "Status: SYNCING",
+                        f"Progress: {progress['processed_files']}/{progress['total_files']} files",
+                        f"Chunks: {progress['total_chunks']}",
+                        f"Duration: {progress['duration']:.1f}s",
+                        f"Errors: {progress['errors']}"
+                    ])
+                else:
+                    # Not actively syncing
+                    result_lines.extend([
+                        "Status: IDLE",
+                        f"Last Sync: {datetime.fromtimestamp(status['last_sync']).strftime('%Y-%m-%d %H:%M:%S') if status.get('last_sync') else 'Never'}",
+                        f"Total Files: {status.get('total_files', 0)}",
+                        f"Total Chunks: {status.get('total_chunks', 0)}"
+                    ])
+                
+                return [types.TextContent(type="text", text="\n".join(result_lines))]
+            else:
+                # Standard RepositorySync
+                status = self.repository_sync.get_repository_status(repository_name)
+                
+                if not status:
+                    return [types.TextContent(type="text", text=f"Repository '{repository_name}' not found")]
+                
+                result_lines = [
+                    f"Repository Status: {repository_name}",
+                    "",
+                    f"Path: {status['path']}",
+                    f"Total Files: {status.get('total_files', 0)}",
+                    f"Cached Files: {status['cached_files']}",
+                    f"Total Chunks: {status.get('total_chunks', 0)}",
+                    f"Last Sync: {datetime.fromtimestamp(status['last_sync']).strftime('%Y-%m-%d %H:%M:%S')}",
+                    f"Sync Type: {status.get('sync_type', 'unknown')}",
+                    f"File Watching: {'Enabled' if status['is_watching'] else 'Disabled'}",
+                ]
+                
+                return [types.TextContent(type="text", text="\n".join(result_lines))]
             
         except Exception as e:
             logger.error(f"Error getting repository status: {str(e)}")
@@ -1987,6 +2035,28 @@ class EnhancedMemoryServer(MemoryServer):
         except Exception as e:
             logger.error(f"Failed to get auto-sync paths: {e}")
             return [types.TextContent(type="text", text=f"Error: {str(e)}")]
+    
+    async def cleanup(self):
+        """Clean up resources when shutting down."""
+        logger.info("Cleaning up enhanced memory server resources...")
+        
+        try:
+            # Shutdown async repository sync if it's active
+            if hasattr(self.repository_sync, 'shutdown'):
+                logger.info("Shutting down async repository sync...")
+                self.repository_sync.shutdown()
+            
+            # Stop auto-sync manager if active
+            if hasattr(self, 'auto_sync_manager') and self.auto_sync_manager:
+                if hasattr(self.auto_sync_manager, 'stop'):
+                    logger.info("Stopping auto-sync manager...")
+                    await self.auto_sync_manager.stop()
+            
+            # Clean up any other resources
+            logger.info("Enhanced memory server cleanup completed")
+            
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
 
 # Entry point for enhanced server
 async def main():
