@@ -20,7 +20,12 @@ The MCP Memory Service now supports concurrent access from multiple Claude Code 
 - Built-in request queue for serializing operations when needed
 - Prevents overwhelming the database with concurrent requests
 
-### 4. Monitoring
+### 4. True Async Operations
+- All ChromaDB operations run in a thread pool executor
+- Prevents blocking the async event loop
+- Maintains high concurrency without blocking other requests
+
+### 5. Monitoring
 - New MCP tool: `get_concurrent_access_stats`
 - Tracks lock acquisitions, wait times, and failures
 - Provides insights into concurrent usage patterns
