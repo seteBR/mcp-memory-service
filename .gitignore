@@ -1,6 +1,9 @@
 # Aider files
 .aider.*
 
+# Project-specific development guidelines (may vary between developers)
+CLAUDE.md
+
 # Python
 __pycache__/
 *.py[cod]
