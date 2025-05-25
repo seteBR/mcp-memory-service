@@ -27,6 +27,10 @@ Talk to the Repo with [TalkToGitHub](https://talktogithub.com/doobidoo/mcp-memor
 - **Cross-platform compatibility** (Apple Silicon, Intel, Windows, Linux)
 - **Hardware-aware optimizations** for different environments
 - **Graceful fallbacks** for limited hardware resources
+- **Concurrent access support** for multiple Claude Code instances
+- **True asynchronous operations** with non-blocking database access
+- **Automatic retry logic** with exponential backoff
+- **Lock statistics and monitoring** for performance insights
 
 ## Installation
 
@@ -228,6 +232,35 @@ MCP_MEMORY_BATCH_SIZE: Override the default batch size
 | Linux | x86_64 | ROCm | ✅ Supported |
 | Linux | x86_64 | CPU | ✅ Supported with fallbacks |
 | Linux | ARM64 | CPU | ✅ Supported with fallbacks |
+
+## Concurrent Access Support
+
+The MCP Memory Service now supports safe concurrent access from multiple Claude Code instances. This feature is automatically enabled and requires no configuration.
+
+### Key Benefits
+- **Multiple Users**: Multiple developers can use Claude Code on the same codebase simultaneously
+- **Data Safety**: File-based locking prevents database corruption
+- **Performance**: Non-blocking async operations maintain responsiveness
+- **Monitoring**: Built-in statistics track lock performance
+
+### Usage
+Simply run multiple Claude Code instances - the service handles concurrency automatically:
+
+```bash
+# Terminal 1
+claude-code --project /path/to/project
+
+# Terminal 2 (same or different machine)
+claude-code --project /path/to/project
+```
+
+### Monitoring
+Check concurrent access statistics using the MCP tool:
+```json
+{"tool": "get_concurrent_access_stats"}
+```
+
+For detailed information, see the [Concurrent Access Guide](docs/CONCURRENT_ACCESS_GUIDE.md).
 
 ## Testing
 
