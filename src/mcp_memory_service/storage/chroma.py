@@ -12,6 +12,8 @@ import sys
 import os
 import time
 import traceback
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from chromadb.utils import embedding_functions
 from sentence_transformers import SentenceTransformer
 import logging
@@ -54,6 +56,8 @@ class ChromaMemoryStorage(MemoryStorage):
         self.system_info = get_system_info()
         self.embedding_settings = get_optimal_embedding_settings()
         self._chroma_lock = ChromaDBLock(path)
+        # Thread pool for running synchronous ChromaDB operations
+        self._executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="chromadb")
         
         # Log system information
         logger.info(f"Detected system: {self.system_info.os_name} {self.system_info.architecture}")
@@ -209,6 +213,11 @@ class ChromaMemoryStorage(MemoryStorage):
         logger.error(f"Invalid timestamp type: {type(ts)}")
         return time.time()
     
+    async def _run_async(self, func, *args, **kwargs):
+        """Run a synchronous function asynchronously in the thread pool."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(self._executor, func, *args, **kwargs)
+    
     @with_chroma_lock(timeout=30.0)
     @with_retry(max_attempts=3, delay=1.0)
     async def store(self, memory: Memory) -> Tuple[bool, str]:
@@ -219,9 +228,10 @@ class ChromaMemoryStorage(MemoryStorage):
                 error_msg = "Collection not initialized, cannot store memory"
                 logger.error(error_msg)
                 return False, error_msg
-                
+            
             # Check for duplicates
-            existing = self.collection.get(
+            existing = await self._run_async(
+                self.collection.get,
                 where={"content_hash": memory.content_hash}
             )
             if existing["ids"]:
@@ -237,7 +247,8 @@ class ChromaMemoryStorage(MemoryStorage):
             memory_id = memory.content_hash
             
             # Add to collection - embedding will be automatically generated
-            self.collection.add(
+            await self._run_async(
+                self.collection.add,
                 documents=[memory.content],
                 metadatas=[metadata],
                 ids=[memory_id]
@@ -252,7 +263,8 @@ class ChromaMemoryStorage(MemoryStorage):
 
     async def search_by_tag(self, tags: List[str]) -> List[Memory]:
         try:
-            results = self.collection.get(
+            results = await self._run_async(
+                self.collection.get,
                 include=["metadatas", "documents"]
             )
 
@@ -293,7 +305,8 @@ class ChromaMemoryStorage(MemoryStorage):
         """Deletes memories that match the specified tag."""
         try:
             # Get all the documents from ChromaDB
-            results = self.collection.get(
+            results = await self._run_async(
+                self.collection.get,
                 include=["metadatas"]
             )
 
@@ -313,7 +326,10 @@ class ChromaMemoryStorage(MemoryStorage):
                 return 0, f"No memories found with tag: {tag}"
 
             # Delete memories
-            self.collection.delete(ids=ids_to_delete)
+            await self._run_async(
+                self.collection.delete,
+                ids=ids_to_delete
+            )
 
             return len(ids_to_delete), f"Successfully deleted {len(ids_to_delete)} memories with tag: {tag}"
 
@@ -327,7 +343,8 @@ class ChromaMemoryStorage(MemoryStorage):
         """Delete a memory by its hash."""
         try:
             # First check if the memory exists
-            existing = self.collection.get(
+            existing = await self._run_async(
+                self.collection.get,
                 where={"content_hash": content_hash}
             )
             
@@ -335,7 +352,8 @@ class ChromaMemoryStorage(MemoryStorage):
                 return False, f"No memory found with hash {content_hash}"
             
             # Delete the memory
-            self.collection.delete(
+            await self._run_async(
+                self.collection.delete,
                 where={"content_hash": content_hash}
             )
             
@@ -350,7 +368,7 @@ class ChromaMemoryStorage(MemoryStorage):
         """Remove duplicate memories based on content hash."""
         try:
             # Get all memories
-            results = self.collection.get()
+            results = await self._run_async(self.collection.get)
             
             if not results["ids"]:
                 return 0, "No memories found in database"
@@ -372,7 +390,8 @@ class ChromaMemoryStorage(MemoryStorage):
             
             # Delete duplicates if found
             if duplicates:
-                self.collection.delete(
+                await self._run_async(
+                    self.collection.delete,
                     ids=duplicates
                 )
                 return len(duplicates), f"Successfully removed {len(duplicates)} duplicate memories"
@@ -426,7 +445,8 @@ class ChromaMemoryStorage(MemoryStorage):
             if query:
                 # Combined semantic search with time filtering
                 try:
-                    results = self.collection.query(
+                    results = await self._run_async(
+                        self.collection.query,
                         query_texts=[query],
                         n_results=n_results,
                         where=where_clause,
@@ -475,7 +495,8 @@ class ChromaMemoryStorage(MemoryStorage):
                     logger.info("Falling back to time-based retrieval")
             
             # Time-based filtering only (or fallback from failed semantic search)
-            results = self.collection.get(
+            results = await self._run_async(
+                self.collection.get,
                 where=where_clause,
                 limit=n_results,
                 include=["metadatas", "documents"]
@@ -536,7 +557,11 @@ class ChromaMemoryStorage(MemoryStorage):
                 ]
             }
 
-            results = self.collection.get(include=["metadatas"], where=where_clause)
+            results = await self._run_async(
+                self.collection.get,
+                include=["metadatas"],
+                where=where_clause
+            )
             ids_to_delete = []
 
             if results.get("ids"):
@@ -552,7 +577,10 @@ class ChromaMemoryStorage(MemoryStorage):
             if not ids_to_delete:
                 return 0, "No memories found matching the criteria."
 
-            self.collection.delete(ids=ids_to_delete)
+            await self._run_async(
+                self.collection.delete,
+                ids=ids_to_delete
+            )
             return len(ids_to_delete), None
 
         except Exception as e:
@@ -567,7 +595,11 @@ class ChromaMemoryStorage(MemoryStorage):
 
             where_clause = {"timestamp": {"$lt": before_timestamp}}
 
-            results = self.collection.get(include=["metadatas"], where=where_clause)
+            results = await self._run_async(
+                self.collection.get,
+                include=["metadatas"],
+                where=where_clause
+            )
             ids_to_delete = []
 
             if results.get("ids"):
@@ -583,12 +615,20 @@ class ChromaMemoryStorage(MemoryStorage):
             if not ids_to_delete:
                 return 0, "No memories found matching the criteria."
 
-            self.collection.delete(ids=ids_to_delete)
+            await self._run_async(
+                self.collection.delete,
+                ids=ids_to_delete
+            )
             return len(ids_to_delete), None
 
         except Exception as e:
             logger.exception("Error deleting memories before date:")
             return 0, str(e)
+    
+    async def close(self):
+        """Close the storage and cleanup resources."""
+        if hasattr(self, '_executor'):
+            self._executor.shutdown(wait=True)
 
 
     def _format_metadata_for_chroma(self, memory: Memory) -> Dict[str, Any]:
@@ -653,7 +693,8 @@ class ChromaMemoryStorage(MemoryStorage):
             
             try:
                 # Query using the embedding function with hardware-aware settings
-                results = self.collection.query(
+                results = await self._run_async(
+                    self.collection.query,
                     query_texts=[query],
                     n_results=n_results,
                     include=["documents", "metadatas", "distances"]
@@ -674,7 +715,8 @@ class ChromaMemoryStorage(MemoryStorage):
                         ).tolist()
                         
                         # Use the embedding directly
-                        results = self.collection.query(
+                        results = await self._run_async(
+                            self.collection.query,
                             query_embeddings=[query_embedding],
                             n_results=n_results,
                             include=["documents", "metadatas", "distances"]
