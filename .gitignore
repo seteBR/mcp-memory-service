@@ -28,6 +28,7 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+mcp-memory-service/
 
 # Python project tools
 pip-wheel-metadata/

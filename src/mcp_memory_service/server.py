@@ -1172,13 +1172,26 @@ async def async_main():
     print(f"Optimal Model: {system_info.get_optimal_model()}", file=sys.stderr, flush=True)
     print(f"Optimal Batch Size: {system_info.get_optimal_batch_size()}", file=sys.stderr, flush=True)
     print(f"ChromaDB Path: {CHROMA_PATH}", file=sys.stderr, flush=True)
+    print(f"Code Intelligence: {'Enabled' if os.getenv('ENABLE_CODE_INTELLIGENCE', 'false').lower() == 'true' else 'Disabled'}", file=sys.stderr, flush=True)
     print("================================================\n", file=sys.stderr, flush=True)
     
     logger.info(f"Starting MCP Memory Service with ChromaDB path: {CHROMA_PATH}")
     
     try:
-        # Create server instance with hardware-aware configuration
-        memory_server = MemoryServer()
+        # Check if code intelligence is enabled
+        enable_code_intelligence = os.getenv("ENABLE_CODE_INTELLIGENCE", "false").lower() == "true"
+        enable_file_watching = os.getenv("ENABLE_FILE_WATCHING", "true").lower() == "true"
+        
+        if enable_code_intelligence:
+            logger.info("Code Intelligence features enabled - using EnhancedMemoryServer")
+            from .enhanced_server import EnhancedMemoryServer
+            memory_server = EnhancedMemoryServer(
+                enable_code_intelligence=True,
+                enable_file_watching=enable_file_watching
+            )
+        else:
+            # Create standard server instance with hardware-aware configuration
+            memory_server = MemoryServer()
         
         # Set up async initialization with timeout and retry logic
         max_retries = 2
