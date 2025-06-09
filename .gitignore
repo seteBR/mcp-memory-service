@@ -60,6 +60,7 @@ chroma_db/
 chromadb/
 tests/test_db/chroma.sqlite3
 *.sqlite3
+chromadb_export.json
 
 # Project-specific artifacts
 backups/
