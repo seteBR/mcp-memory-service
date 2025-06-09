@@ -199,7 +199,7 @@ class MemoryServer:
                 
                 # Attempt repair
                 logger.info("Attempting database repair...")
-                repair_success, repair_message = await loop.run_in_executor(None, repair_database, self.storage)
+                repair_success, repair_message = await repair_database(self.storage)
                 
                 if not repair_success:
                     logger.error(f"Database repair failed: {repair_message}")
@@ -674,10 +674,9 @@ class MemoryServer:
             # Add debug logging to trace the hang
             logger.debug("validate_database_health: Starting...")
             
-            # Check database health - run sync function in executor to avoid blocking
+            # Check database health
             logger.debug("validate_database_health: Calling validate_database...")
-            loop = asyncio.get_event_loop()
-            is_valid, message = await loop.run_in_executor(None, validate_database, self.storage)
+            is_valid, message = await validate_database(self.storage)
             logger.debug(f"validate_database_health: validate_database returned: {is_valid}, {message}")
             
             if not is_valid:
@@ -689,7 +688,7 @@ class MemoryServer:
                     return False
                 
                 logger.info("Attempting database repair...")
-                repair_success, repair_message = await loop.run_in_executor(None, repair_database, self.storage)
+                repair_success, repair_message = await repair_database(self.storage)
                 
                 if not repair_success:
                     logger.error(f"Database repair failed: {repair_message}")

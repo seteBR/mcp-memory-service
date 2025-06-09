@@ -441,14 +441,17 @@ def run_memory_server_with_uv():
         # Get the directory of this script
         script_dir = os.path.dirname(os.path.abspath(__file__))
         
-        # Run memory server using UV
+        # If we have MCP_MEMORY_SERVICE_DIR set, use it
+        mcp_service_dir = os.environ.get("MCP_MEMORY_SERVICE_DIR", script_dir)
+        
+        # Run memory server using UV from the correct directory
         uv_cmd = [sys.executable, '-m', 'uv', 'run', 'memory']
         
         if DEBUG:
             uv_cmd.append('--debug')
             
-        print_debug(f"Running command: {' '.join(uv_cmd)}")
-        subprocess.run(uv_cmd, check=True)
+        print_debug(f"Running command: {' '.join(uv_cmd)} in directory: {mcp_service_dir}")
+        subprocess.run(uv_cmd, check=True, cwd=mcp_service_dir)
     except subprocess.SubprocessError as e:
         print_error(f"Error running memory server with UV: {e}")
         print_debug(traceback.format_exc())
@@ -478,8 +481,11 @@ def run_memory_server_classic():
         # Get the directory of this script
         script_dir = os.path.dirname(os.path.abspath(__file__))
         
+        # If we have MCP_MEMORY_SERVICE_DIR set, use it
+        mcp_service_dir = os.environ.get("MCP_MEMORY_SERVICE_DIR", script_dir)
+        
         # Add src directory to path if it exists
-        src_dir = os.path.join(script_dir, "src")
+        src_dir = os.path.join(mcp_service_dir, "src")
         if os.path.exists(src_dir) and src_dir not in sys.path:
             print_debug(f"Adding {src_dir} to sys.path")
             sys.path.insert(0, src_dir)

@@ -78,6 +78,15 @@ def rebuild_database(exported_data=None):
         model_name="all-mpnet-base-v2"
     )
     
+    try:
+        # Try to get existing collection first
+        collection = client.get_collection("memory_collection")
+        logger.warning("Collection already exists, deleting it...")
+        client.delete_collection("memory_collection")
+    except Exception:
+        # Collection doesn't exist, that's fine
+        pass
+    
     collection = client.create_collection(
         name="memory_collection",
         embedding_function=embedding_function

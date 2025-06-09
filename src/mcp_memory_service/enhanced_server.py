@@ -52,10 +52,7 @@ class EnhancedMemoryServer(MemoryServer):
             if use_async_sync:
                 logger.info("Using AsyncRepositorySync for non-blocking operations")
                 self.repository_sync = AsyncRepositorySync(
-                    storage_backend=self.storage,
-                    enable_file_watching=enable_file_watching,
-                    max_queue_size=int(os.getenv("SYNC_QUEUE_SIZE", "10000")),
-                    batch_size=int(os.getenv("SYNC_BATCH_SIZE", "100"))
+                    storage_backend=self.storage
                 )
             else:
                 logger.info("Using standard RepositorySync (may block during sync)")

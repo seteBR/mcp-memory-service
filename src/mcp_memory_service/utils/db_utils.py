@@ -12,7 +12,7 @@ import time
 
 logger = logging.getLogger(__name__)
 
-def validate_database(storage) -> Tuple[bool, str]:
+async def validate_database(storage) -> Tuple[bool, str]:
     """Validate database health and configuration."""
     try:
         logger.debug("Starting database validation...")
@@ -171,11 +171,11 @@ def backup_database(storage_path: str) -> str:
         logger.error(f"Failed to backup database: {str(e)}")
         raise
 
-def repair_database(storage) -> Tuple[bool, str]:
+async def repair_database(storage) -> Tuple[bool, str]:
     """Attempt to repair database issues."""
     try:
         # First, try to validate current state
-        is_valid, message = validate_database(storage)
+        is_valid, message = await validate_database(storage)
         if is_valid and "segmentation" not in message.lower():
             return True, "Database is already healthy"
         
@@ -289,7 +289,7 @@ def repair_database(storage) -> Tuple[bool, str]:
             logger.info(f"Restoration complete: {restored_count} succeeded, {failed_count} failed")
         
         # Validate repair
-        is_valid, message = validate_database(storage)
+        is_valid, message = await validate_database(storage)
         if is_valid:
             return True, f"Database successfully repaired. {message}"
         else:

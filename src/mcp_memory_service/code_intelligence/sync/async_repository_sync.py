@@ -1,383 +1,452 @@
 """
-Asynchronous repository synchronization that doesn't block other operations.
-This implementation uses background tasks and batch processing to avoid blocking.
+Fixed AsyncRepositorySync that batches storage operations to avoid lock contention.
 """
-
 import asyncio
-import hashlib
-import logging
-import os
 import time
-from dataclasses import dataclass, field
+import hashlib
 from pathlib import Path
-from typing import List, Dict, Set, Optional, Tuple, Any
-from datetime import datetime
+from typing import Dict, List, Optional
+from dataclasses import dataclass, field
+import logging
 from concurrent.futures import ThreadPoolExecutor
-import queue
-import threading
 
 from ..chunker.factory import ChunkerFactory
-from ...models.code import CodeChunk
-from .repository_sync import FileMetadata, SyncResult, RepositorySync
+from ..chunker.extended_factory import initialize_extended_file_support
+from ...models.memory import Memory
+from ...utils.hashing import generate_content_hash
+
+# Initialize extended file support
+initialize_extended_file_support()
 
 logger = logging.getLogger(__name__)
 
 
-class AsyncRepositorySync(RepositorySync):
-    """Non-blocking repository synchronization using background processing."""
+@dataclass
+class FileMetadata:
+    """Metadata for a scanned file."""
+    path: str
+    size: int
+    modified: float
+    content_hash: str
+
+
+@dataclass
+class SyncResult:
+    """Result of repository synchronization."""
+    repository_name: str = ""
+    repository_path: str = ""
+    total_files: int = 0
+    processed_files: int = 0
+    new_files: int = 0
+    modified_files: int = 0
+    deleted_files: int = 0
+    total_chunks: int = 0
+    new_chunks: int = 0
+    updated_chunks: int = 0
+    deleted_chunks: int = 0
+    files_scanned: int = 0
+    sync_duration: float = 0.0
+    errors: List[str] = field(default_factory=list)
+    success_rate: float = 100.0
     
-    def __init__(self, storage_backend, enable_file_watching: bool = True, 
-                 max_queue_size: int = 10000, batch_size: int = 100):
-        super().__init__(storage_backend, enable_file_watching)
-        
-        # Queue for chunks to be processed
-        self.chunk_queue = queue.Queue(maxsize=max_queue_size)
-        self.batch_size = batch_size
-        
-        # Background worker thread for processing chunks
-        self.worker_thread = None
-        self.worker_running = False
-        
-        # Track active sync operations
-        self.active_syncs: Dict[str, SyncResult] = {}
-        self.sync_lock = threading.Lock()
-        
-        # Start background worker
-        self._start_worker()
+    def add_error(self, error: str):
+        """Add an error to the result."""
+        self.errors.append(error)
+        if self.total_files > 0:
+            self.success_rate = ((self.processed_files - len(self.errors)) / self.total_files) * 100
+
+
+class AsyncRepositorySync:
+    """
+    Fixed version that batches memory storage to avoid lock contention.
+    All operations complete before returning.
+    """
     
-    def _start_worker(self):
-        """Start background worker thread for processing chunks."""
-        if not self.worker_thread or not self.worker_thread.is_alive():
-            self.worker_running = True
-            self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
-            self.worker_thread.start()
-            logger.info("Started background chunk processing worker")
-    
-    def _worker_loop(self):
-        """Background worker loop for processing chunks."""
-        batch = []
-        last_process_time = time.time()
+    def __init__(self, storage_backend):
+        self.storage = storage_backend
+        self.repositories: Dict[str, dict] = {}
+        self.file_cache: Dict[str, Dict[str, FileMetadata]] = {}
+        self.active_syncs: Dict[str, SyncResult] = {}  # For compatibility
+        self.sync_lock = asyncio.Lock()  # For compatibility
         
-        while self.worker_running:
-            try:
-                # Try to get items with timeout
-                try:
-                    item = self.chunk_queue.get(timeout=1.0)
-                    if item is None:  # Shutdown signal
-                        break
-                    batch.append(item)
-                except queue.Empty:
-                    pass
-                
-                # Process batch if it's full or timeout reached
-                should_process = (
-                    len(batch) >= self.batch_size or 
-                    (len(batch) > 0 and time.time() - last_process_time > 5.0)  # 5 second timeout
-                )
-                
-                if should_process and batch:
-                    # Process batch asynchronously
-                    asyncio.run(self._process_batch(batch))
-                    batch = []
-                    last_process_time = time.time()
-                    
-            except Exception as e:
-                logger.error(f"Error in chunk processing worker: {e}")
-                # Don't lose the batch on error
-                if batch:
-                    for item in batch:
-                        try:
-                            self.chunk_queue.put_nowait(item)
-                        except queue.Full:
-                            logger.warning("Queue full, dropping chunk")
-                batch = []
-    
-    async def _process_batch(self, batch: List[Tuple[CodeChunk, str]]):
-        """Process a batch of chunks asynchronously."""
-        logger.debug(f"Processing batch of {len(batch)} chunks")
+        # Thread pool for file I/O operations
+        self.executor = ThreadPoolExecutor(max_workers=4)
         
-        # Group by repository
-        repo_chunks = {}
-        for chunk, repo_name in batch:
-            if repo_name not in repo_chunks:
-                repo_chunks[repo_name] = []
-            repo_chunks[repo_name].append(chunk)
+        # Semaphore to limit concurrent chunk processing
+        self.chunk_semaphore = asyncio.Semaphore(10)
         
-        # Process each repository's chunks
-        for repo_name, chunks in repo_chunks.items():
-            try:
-                # Store chunks
-                stored = 0
-                for chunk in chunks:
-                    memory = chunk.to_memory()
-                    success, _ = await self.storage.store(memory)
-                    if success:
-                        stored += 1
-                
-                # Update sync result if active
-                with self.sync_lock:
-                    if repo_name in self.active_syncs:
-                        result = self.active_syncs[repo_name]
-                        result.total_chunks += len(chunks)
-                        result.new_chunks += stored
-                        
-                logger.debug(f"Stored {stored}/{len(chunks)} chunks for {repo_name}")
-                
-            except Exception as e:
-                logger.error(f"Error processing batch for {repo_name}: {e}")
-                with self.sync_lock:
-                    if repo_name in self.active_syncs:
-                        self.active_syncs[repo_name].add_error(f"Batch processing error: {str(e)}")
-    
-    async def sync_repository(self, repository_path: str, repository_name: str, 
-                            incremental: bool = True, force_full: bool = False) -> SyncResult:
-        """Non-blocking repository synchronization."""
+    async def sync_repository(
+        self,
+        repository_path: str,
+        repository_name: str,
+        incremental: bool = True,
+        force_full: bool = False
+    ) -> SyncResult:
+        """
+        Synchronize a repository with batched storage operations.
+        Completes all work before returning.
+        """
         start_time = time.time()
-        
-        logger.info(f"Starting async {'incremental' if incremental and not force_full else 'full'} sync of repository: {repository_name}")
         
         # Initialize result
         result = SyncResult(
             repository_name=repository_name,
-            repository_path=repository_path,
-            total_files=0,
-            processed_files=0,
-            new_files=0,
-            modified_files=0,
-            deleted_files=0,
-            total_chunks=0,
-            new_chunks=0,
-            updated_chunks=0,
-            deleted_chunks=0,
-            sync_duration=0.0
+            repository_path=repository_path
         )
-        
-        # Track this sync operation
-        with self.sync_lock:
-            self.active_syncs[repository_name] = result
         
         try:
             # Validate repository path
             repo_path = Path(repository_path).resolve()
             if not repo_path.exists() or not repo_path.is_dir():
                 result.add_error(f"Invalid repository path: {repository_path}")
+                result.sync_duration = time.time() - start_time
                 return result
             
-            # Store repository metadata
+            # Update repository metadata
             self.repositories[repository_name] = {
                 'path': str(repo_path),
                 'last_sync': time.time(),
-                'total_files': 0,
-                'total_chunks': 0,
                 'sync_type': 'full' if not incremental or force_full else 'incremental'
             }
             
-            # Start async file scanning
-            scan_task = asyncio.create_task(self._scan_repository_async(repo_path))
-            
-            # Return immediately with initial result
-            # The background worker will continue processing
-            asyncio.create_task(self._complete_sync(
-                repository_name, repo_path, scan_task, result, 
-                incremental, force_full, start_time
-            ))
-            
-            # Return partial result immediately
-            result.sync_duration = time.time() - start_time
-            return result
-            
-        except Exception as e:
-            result.add_error(f"Sync initialization failed: {str(e)}")
-            logger.error(f"Repository sync failed for {repository_name}: {e}")
-            result.sync_duration = time.time() - start_time
-            return result
-    
-    async def _complete_sync(self, repository_name: str, repo_path: Path, 
-                           scan_task: asyncio.Task, result: SyncResult,
-                           incremental: bool, force_full: bool, start_time: float):
-        """Complete the sync operation in the background."""
-        try:
-            # Wait for scan to complete
-            current_files = await scan_task
+            # Step 1: Scan repository for files
+            logger.info(f"Scanning repository: {repository_name}")
+            current_files = await self._scan_repository_async(repo_path)
+            result.files_scanned = len(current_files)
             result.total_files = len(current_files)
             
-            # Initialize cache if needed
-            if repository_name not in self.file_cache:
-                self.file_cache[repository_name] = {}
+            if not current_files:
+                logger.info(f"No supported files found in {repository_path}")
+                result.sync_duration = time.time() - start_time
+                return result
             
-            cached_files = self.file_cache[repository_name]
+            # Step 2: Determine which files to process
+            cached_files = self.file_cache.get(repository_name, {}) if incremental and not force_full else {}
+            files_to_process = []
             
-            # Process files asynchronously
-            if not incremental or force_full or not cached_files:
-                # Full sync - process all files
-                for file_path, metadata in current_files.items():
-                    await self._queue_file_for_processing(repository_name, file_path, metadata)
+            for file_path, metadata in current_files.items():
+                if file_path not in cached_files:
+                    files_to_process.append((file_path, metadata, 'new'))
                     result.new_files += 1
-                    result.processed_files += 1
-            else:
-                # Incremental sync
-                # New files
-                new_files = set(current_files.keys()) - set(cached_files.keys())
-                for file_path in new_files:
-                    await self._queue_file_for_processing(repository_name, file_path, current_files[file_path])
-                    result.new_files += 1
-                    result.processed_files += 1
-                
-                # Modified files
-                for file_path, metadata in current_files.items():
-                    if file_path in cached_files:
-                        cached = cached_files[file_path]
-                        if metadata.content_hash != cached.content_hash:
-                            await self._queue_file_for_processing(repository_name, file_path, metadata)
-                            result.modified_files += 1
-                            result.processed_files += 1
-                
-                # Deleted files
+                elif metadata.content_hash != cached_files[file_path].content_hash:
+                    files_to_process.append((file_path, metadata, 'modified'))
+                    result.modified_files += 1
+            
+            # Deleted files (for incremental sync)
+            if incremental and not force_full:
                 deleted_files = set(cached_files.keys()) - set(current_files.keys())
                 result.deleted_files = len(deleted_files)
                 # TODO: Handle deletion of chunks for deleted files
             
-            # Update cache
-            self.file_cache[repository_name] = current_files
+            # Step 3: Process files and collect memories
+            logger.info(f"Processing {len(files_to_process)} files for {repository_name}")
             
-            # Update final duration
-            result.sync_duration = time.time() - start_time
+            # Collect all memories to store in batch
+            all_memories = []
+            
+            # Process files in batches
+            batch_size = 10
+            for i in range(0, len(files_to_process), batch_size):
+                batch = files_to_process[i:i + batch_size]
+                
+                # Process batch concurrently and collect memories
+                tasks = [
+                    self._process_file_for_memories(file_info, repository_name, result)
+                    for file_info in batch
+                ]
+                
+                # Wait for batch to complete and collect memories
+                batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                for batch_result in batch_results:
+                    if isinstance(batch_result, list):
+                        all_memories.extend(batch_result)
+                    elif isinstance(batch_result, Exception):
+                        logger.error(f"Error processing file: {batch_result}")
+                        result.add_error(str(batch_result))
+                
+                # Log progress
+                progress = (result.processed_files / len(files_to_process)) * 100
+                logger.info(f"Progress: {result.processed_files}/{len(files_to_process)} files ({progress:.1f}%)")
+            
+            # Step 4: Store all memories in batch
+            if all_memories:
+                logger.info(f"Storing {len(all_memories)} memories in batch...")
+                stored_count = await self._store_memories_batch(all_memories)
+                result.total_chunks = stored_count
+                logger.info(f"Stored {stored_count} memories successfully")
+            
+            # Step 5: Update cache
+            self.file_cache[repository_name] = current_files
             
             # Update repository metadata
             self.repositories[repository_name].update({
                 'last_sync': time.time(),
                 'total_files': result.total_files,
-                'total_chunks': result.total_chunks,
-                'sync_type': 'full' if not incremental or force_full else 'incremental'
+                'total_chunks': result.total_chunks
             })
             
-            logger.info(f"Repository sync completed (async): {repository_name} in {result.sync_duration:.2f}s")
-            
         except Exception as e:
-            result.add_error(f"Background sync failed: {str(e)}")
-            logger.error(f"Background sync error for {repository_name}: {e}")
-        finally:
-            # Remove from active syncs after a delay to allow final updates
-            await asyncio.sleep(10)
-            with self.sync_lock:
-                self.active_syncs.pop(repository_name, None)
-    
-    async def _scan_repository_async(self, repo_path: Path) -> Dict[str, FileMetadata]:
-        """Scan repository asynchronously."""
-        loop = asyncio.get_event_loop()
+            result.add_error(f"Sync failed: {str(e)}")
+            logger.error(f"Repository sync failed for {repository_name}: {e}")
         
-        # Run the scan in a thread pool to avoid blocking
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            return await loop.run_in_executor(
-                executor, 
-                self._scan_repository_sync, 
-                repo_path
+        finally:
+            # Calculate final metrics
+            result.sync_duration = time.time() - start_time
+            
+            logger.info(
+                f"Repository sync completed: {repository_name} - "
+                f"{result.processed_files}/{result.total_files} files, "
+                f"{result.total_chunks} chunks in {result.sync_duration:.2f}s"
+            )
+        
+        return result
+    
+    async def _process_file_for_memories(
+        self, 
+        file_info: tuple, 
+        repository_name: str, 
+        result: SyncResult
+    ) -> List[Memory]:
+        """Process a single file and return memories to store."""
+        async with self.chunk_semaphore:
+            return await self._process_single_file_for_memories(
+                file_info, repository_name, result
             )
     
+    async def _process_single_file_for_memories(
+        self, 
+        file_info: tuple, 
+        repository_name: str, 
+        result: SyncResult
+    ) -> List[Memory]:
+        """Process a single file and return memories."""
+        file_path, metadata, status = file_info
+        memories = []
+        
+        try:
+            # Read file content
+            loop = asyncio.get_event_loop()
+            content = await loop.run_in_executor(
+                self.executor,
+                self._read_file,
+                file_path
+            )
+            
+            # Detect language
+            factory = ChunkerFactory()
+            language = self._detect_language(file_path)
+            
+            # Get appropriate chunker
+            chunker = factory.get_chunker(language)
+            if not chunker:
+                chunker = factory.get_chunker('generic')
+            
+            # Chunk the content
+            chunks = await loop.run_in_executor(
+                self.executor,
+                chunker.chunk_content,
+                content,
+                file_path
+            )
+            
+            # Create memories for chunks
+            for chunk in chunks:
+                memory = Memory(
+                    content=chunk.text,
+                    content_hash=generate_content_hash(chunk.text),
+                    memory_type="code_chunk",
+                    metadata={
+                        "file_path": file_path,
+                        "repository": repository_name,
+                        "language": language,
+                        "chunk_type": chunk.chunk_type,
+                        "chunk_id": chunk.chunk_id,
+                        "start_line": chunk.start_line,
+                        "end_line": chunk.end_line,
+                        "code_chunk": True
+                    }
+                )
+                memories.append(memory)
+            
+            result.processed_files += 1
+            result.total_chunks += len(chunks)
+            
+        except Exception as e:
+            result.add_error(f"Error processing {file_path}: {str(e)}")
+            logger.error(f"Error processing file {file_path}: {e}")
+        
+        return memories
+    
+    async def _store_memories_batch(self, memories: List[Memory]) -> int:
+        """Store memories in batch to minimize lock contention."""
+        stored = 0
+        batch_size = 50  # Store 50 memories at a time
+        
+        for i in range(0, len(memories), batch_size):
+            batch = memories[i:i + batch_size]
+            
+            # Store each batch with a small delay to allow other operations
+            for memory in batch:
+                try:
+                    await self.storage.store(memory)
+                    stored += 1
+                except Exception as e:
+                    logger.error(f"Failed to store memory: {e}")
+            
+            # Small delay between batches to prevent lock starvation
+            if i + batch_size < len(memories):
+                await asyncio.sleep(0.1)
+        
+        return stored
+    
+    async def _scan_repository_async(self, repo_path: Path) -> Dict[str, FileMetadata]:
+        """Scan repository for supported files."""
+        loop = asyncio.get_event_loop()
+        
+        # Run the synchronous scan in thread pool
+        return await loop.run_in_executor(
+            self.executor,
+            self._scan_repository_sync,
+            repo_path
+        )
+    
     def _scan_repository_sync(self, repo_path: Path) -> Dict[str, FileMetadata]:
-        """Synchronous repository scanning (runs in thread pool)."""
+        """Synchronous repository scanning."""
         files = {}
         factory = ChunkerFactory()
         supported_extensions = factory.get_supported_extensions()
         
+        # Excluded directories
+        excluded_dirs = {
+            'node_modules', '__pycache__', 'target', 'build', 'dist', 
+            'venv', 'env', '.venv', '.env', 'virtualenv',
+            '.git', '.svn', '.hg', '.bzr',
+            'vendor', 'third_party', 'deps', 'dependencies',
+            'packages', '.packages', 'bower_components',
+            'coverage', '.coverage', 'htmlcov',
+            '.pytest_cache', '.mypy_cache', '.ruff_cache',
+            'site-packages', 'dist-packages',
+            '.idea', '.vscode', '.eclipse'
+        }
+        
         for file_path in repo_path.rglob('*'):
-            if file_path.is_file() and file_path.suffix.lower() in supported_extensions:
-                # Skip common directories that shouldn't be indexed
-                if any(part.startswith('.') or part in ['node_modules', '__pycache__', 'target', 'build', 'dist', 'venv', 'env'] 
-                       for part in file_path.parts):
+            if not file_path.is_file():
+                continue
+            
+            # Check if extension is supported
+            file_ext = file_path.suffix.lower()
+            if file_ext not in supported_extensions and file_path.name not in supported_extensions:
+                continue
+            
+            # Skip excluded directories
+            if any(part in excluded_dirs for part in file_path.parts):
+                continue
+            
+            try:
+                stat = file_path.stat()
+                
+                # Skip very large files (> 10MB)
+                if stat.st_size > 10 * 1024 * 1024:
                     continue
                 
-                try:
-                    stat = file_path.stat()
-                    
-                    # Calculate content hash
-                    with open(file_path, 'rb') as f:
-                        content_hash = hashlib.sha256(f.read()).hexdigest()
-                    
-                    relative_path = str(file_path.relative_to(repo_path))
-                    files[relative_path] = FileMetadata(
-                        path=relative_path,
-                        size=stat.st_size,
-                        mtime=stat.st_mtime,
-                        content_hash=content_hash,
-                        last_synced=0.0
-                    )
-                    
-                except (OSError, IOError) as e:
-                    logger.warning(f"Could not read file {file_path}: {e}")
+                # Calculate content hash
+                with open(file_path, 'rb') as f:
+                    content_hash = hashlib.sha256(f.read()).hexdigest()
+                
+                files[str(file_path)] = FileMetadata(
+                    path=str(file_path),
+                    size=stat.st_size,
+                    modified=stat.st_mtime,
+                    content_hash=content_hash
+                )
+                
+            except Exception as e:
+                logger.warning(f"Error scanning file {file_path}: {e}")
         
         return files
     
-    async def _queue_file_for_processing(self, repository_name: str, file_path: str, metadata: FileMetadata):
-        """Queue a file for background processing."""
-        factory = ChunkerFactory()
-        chunker = factory.get_chunker(file_path)
-        
-        # Read file content
-        full_path = Path(self.repositories.get(repository_name, {}).get('path', '')) / file_path
+    def _read_file(self, file_path: str) -> str:
+        """Read file content."""
         try:
-            with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-            
-            # Chunk the content
-            chunks = chunker.chunk_content(content, file_path, repository_name)
-            
-            # Queue chunks for processing
-            for chunk in chunks:
-                try:
-                    self.chunk_queue.put_nowait((chunk, repository_name))
-                except queue.Full:
-                    logger.warning(f"Chunk queue full, waiting...")
-                    self.chunk_queue.put((chunk, repository_name))  # Blocking put
-                    
-            # Update metadata
-            metadata.last_synced = time.time()
-            metadata.chunk_count = len(chunks)
-            
-        except Exception as e:
-            logger.error(f"Error processing file {file_path}: {e}")
-            with self.sync_lock:
-                if repository_name in self.active_syncs:
-                    self.active_syncs[repository_name].add_error(f"File processing error: {file_path}: {str(e)}")
+            with open(file_path, 'r', encoding='utf-8') as f:
+                return f.read()
+        except UnicodeDecodeError:
+            # Try with different encoding
+            with open(file_path, 'r', encoding='latin-1') as f:
+                return f.read()
     
-    def get_sync_status(self, repository_name: str) -> Optional[Dict[str, Any]]:
-        """Get current sync status for a repository."""
-        with self.sync_lock:
-            if repository_name in self.active_syncs:
-                result = self.active_syncs[repository_name]
-                return {
-                    'active': True,
-                    'progress': {
-                        'total_files': result.total_files,
-                        'processed_files': result.processed_files,
-                        'total_chunks': result.total_chunks,
-                        'duration': time.time() - (result.sync_duration or 0),
-                        'errors': len(result.errors)
-                    }
-                }
+    def _detect_language(self, file_path: str) -> str:
+        """Detect programming language from file extension."""
+        path = Path(file_path)
+        ext = path.suffix.lower()
         
-        # Check if repository exists but not actively syncing
+        language_map = {
+            '.py': 'python',
+            '.js': 'javascript',
+            '.ts': 'typescript',
+            '.go': 'go',
+            '.rs': 'rust',
+            '.java': 'java',
+            '.cpp': 'cpp',
+            '.c': 'c',
+            '.h': 'c',
+            '.hpp': 'cpp',
+            '.cs': 'csharp',
+            '.rb': 'ruby',
+            '.php': 'php',
+            '.swift': 'swift',
+            '.kt': 'kotlin',
+            '.scala': 'scala',
+            '.r': 'r',
+            '.m': 'matlab',
+            '.jl': 'julia',
+            '.sh': 'bash',
+            '.ps1': 'powershell',
+            '.sql': 'sql',
+            '.html': 'html',
+            '.css': 'css',
+            '.xml': 'xml',
+            '.json': 'json',
+            '.yaml': 'yaml',
+            '.yml': 'yaml',
+            '.md': 'markdown',
+            '.rst': 'restructuredtext',
+            '.tex': 'latex'
+        }
+        
+        return language_map.get(ext, 'generic')
+    
+    async def get_sync_status(self, repository_name: str) -> dict:
+        """Get current sync status."""
         if repository_name in self.repositories:
+            repo = self.repositories[repository_name]
             return {
-                'active': False,
-                'last_sync': self.repositories[repository_name].get('last_sync'),
-                'total_files': self.repositories[repository_name].get('total_files', 0),
-                'total_chunks': self.repositories[repository_name].get('total_chunks', 0)
+                'repository': repository_name,
+                'status': 'synced',
+                'last_sync': repo.get('last_sync'),
+                'total_files': repo.get('total_files', 0),
+                'total_chunks': repo.get('total_chunks', 0)
             }
-        
-        return None
+        return {
+            'repository': repository_name,
+            'status': 'not_synced'
+        }
     
-    def shutdown(self):
-        """Shutdown the async sync service."""
-        logger.info("Shutting down async repository sync...")
+    async def get_repository_stats(self, repository_name: str) -> dict:
+        """Get detailed statistics for a repository."""
+        repo_info = self.repositories.get(repository_name, {})
         
-        # Stop worker
-        self.worker_running = False
-        self.chunk_queue.put(None)  # Shutdown signal
-        
-        if self.worker_thread:
-            self.worker_thread.join(timeout=5.0)
-        
-        # Stop file watcher if enabled
-        if self.file_watcher:
-            self.file_watcher.stop()
+        return {
+            'repository': repository_name,
+            'path': repo_info.get('path', 'Unknown'),
+            'last_sync': repo_info.get('last_sync'),
+            'last_sync_type': repo_info.get('sync_type'),
+            'total_files': repo_info.get('total_files', 0),
+            'total_chunks': repo_info.get('total_chunks', 0),
+            'cached_files': len(self.file_cache.get(repository_name, {}))
+        }
+    
+    async def cleanup(self):
+        """Cleanup resources."""
+        self.executor.shutdown(wait=True)

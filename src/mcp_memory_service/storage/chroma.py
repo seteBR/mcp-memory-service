@@ -215,8 +215,14 @@ class ChromaMemoryStorage(MemoryStorage):
     
     async def _run_async(self, func, *args, **kwargs):
         """Run a synchronous function asynchronously in the thread pool."""
+        from functools import partial
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(self._executor, func, *args, **kwargs)
+        if kwargs:
+            # Use partial to handle keyword arguments
+            func_with_kwargs = partial(func, *args, **kwargs)
+            return await loop.run_in_executor(self._executor, func_with_kwargs)
+        else:
+            return await loop.run_in_executor(self._executor, func, *args)
     
     @with_chroma_lock(timeout=30.0)
     @with_retry(max_attempts=3, delay=1.0)

@@ -57,7 +57,9 @@ __pypackages__/
 
 # ChromaDB artifacts
 chroma_db/
+chromadb/
 tests/test_db/chroma.sqlite3
+*.sqlite3
 
 # Project-specific artifacts
 backups/
@@ -77,6 +79,10 @@ claude_config/claude_desktop_config.json
 *.tmp
 *.old
 
+# Database files
+*.db
+code_intelligence_metrics.db
+
 # Optional: VSCode debugging & Python caches
 *.coverage
 coverage.*
@@ -87,3 +93,29 @@ nosetests.xml
 coverage.xml
 *.cover
 .hypothesis/
+
+# Test files and debugging scripts
+test_*.py
+debug_*.py
+
+# Backup and temporary files
+*.backup
+*.backup2
+
+# VyOS and other config backups
+vyos_*.txt
+vyos_*.md
+
+# Memory and debug output files
+memory_*.txt
+check_*.py
+
+# Claude Code specific files
+claude_code_*.py
+claude_code_*.json
+CLAUDE_CODE_*.md
+MEMORY_*.md
+
+# Scripts for debugging and testing
+scripts/debug_*.py
+scripts/test_*.py
