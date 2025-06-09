@@ -3,7 +3,10 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 import time
+import logging
 from dateutil import parser as dateutil_parser  # For robust ISO parsing
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class Memory:
